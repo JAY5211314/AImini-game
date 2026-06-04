@@ -1,0 +1,1862 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>剑不剑啊</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0e17;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      overflow: hidden;
+    }
+    #wrap { position: relative; }
+    canvas {
+      display: block;
+      border: 2px solid #3d4a6a;
+      border-radius: 4px;
+      box-shadow: 0 0 40px rgba(100, 140, 255, 0.15);
+      cursor: default;
+    }
+    #hint {
+      position: absolute;
+      bottom: -28px;
+      left: 0;
+      right: 0;
+      text-align: center;
+      color: #6a7a9a;
+      font-size: 12px;
+    }
+    #audioPanel {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: flex;
+      gap: 6px;
+      z-index: 5;
+    }
+    #audioPanel button {
+      width: 36px;
+      height: 28px;
+      border: 1px solid #4a5d7a;
+      border-radius: 6px;
+      background: rgba(20, 28, 48, 0.85);
+      color: #c8d4f0;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    #audioPanel button:hover { background: rgba(50, 70, 110, 0.9); }
+    #audioPanel button.active { border-color: #ffd166; color: #ffd166; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="960" height="540"></canvas>
+    <div id="audioPanel">
+      <button id="btnMusic" title="音乐开关">♪</button>
+      <button id="btnSfx" title="音效开关">🔊</button>
+    </div>
+    <div id="hint">双人: 空格/Enter · 单机: 仅空格 · 剑碰对手得分 · ESC 返回菜单 · 点击画面启用声音</div>
+  </div>
+  <script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+  const BOUND_SIDE = 14;
+  const BOUND_TOP = 48;
+  const FLOOR_H = 28;
+
+  const STATE = { MENU: 0, PLAYING: 1, ROUND_END: 2, GAME_END: 3 };
+  const MODE = { PVP: "pvp", SOLO: "solo" };
+
+  let state = STATE.MENU;
+  let gameMode = MODE.PVP;
+  let selectedRounds = 5;
+  let totalRounds = 5;
+  let currentRound = 0;
+  let menuHover = -1;
+  let roundEndTimer = 0;
+  let gameEndTimer = 0;
+  let particles = [];
+  let items = [];
+  let obstacles = [];
+  let itemSpawnTimer = 0;
+  let swordClashCd = 0;
+
+  const COLORS = {
+    p1: "#4ecdc4",
+    p1Dark: "#2a8a84",
+    p2: "#ff6b6b",
+    p2Dark: "#c44",
+    bg1: "#12182a",
+    bg2: "#1a2238",
+    platform: "#2d3a52",
+    platformTop: "#4a5d7a",
+    sword: "#e8e0d0",
+    swordGlow: "rgba(255,220,150,0.4)",
+    ui: "#c8d4f0",
+    gold: "#ffd166",
+  };
+
+  const AUDIO_FILES = {
+    menu: ["audio/menu.mp3", "audio/menu.ogg"],
+    battle: ["audio/battle.mp3", "audio/battle.ogg"],
+    dash: ["audio/dash.mp3", "audio/dash.wav"],
+    clash: ["audio/clash.mp3", "audio/clash.wav"],
+    hit: ["audio/hit.mp3", "audio/hit.wav"],
+    item: ["audio/item.mp3", "audio/item.wav"],
+    bounce: ["audio/bounce.mp3", "audio/bounce.wav"],
+    roundWin: ["audio/round_win.mp3", "audio/round_win.wav"],
+    gameWin: ["audio/game_win.mp3", "audio/game_win.wav"],
+    click: ["audio/click.mp3", "audio/click.wav"],
+  };
+
+  const AudioSys = {
+    ctx: null,
+    master: null,
+    musicGain: null,
+    sfxGain: null,
+    musicOn: true,
+    sfxOn: true,
+    unlocked: false,
+    cache: {},
+    musicEl: null,
+    musicName: "",
+    bgmTimer: null,
+    bgmStep: 0,
+
+    init() {
+      const btnM = document.getElementById("btnMusic");
+      const btnS = document.getElementById("btnSfx");
+      btnM.classList.toggle("active", this.musicOn);
+      btnS.classList.toggle("active", this.sfxOn);
+      btnM.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.unlock();
+        this.musicOn = !this.musicOn;
+        btnM.classList.toggle("active", this.musicOn);
+        if (this.musicOn) this.syncMusic();
+        else this.stopMusic();
+      });
+      btnS.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.unlock();
+        this.sfxOn = !this.sfxOn;
+        btnS.classList.toggle("active", this.sfxOn);
+      });
+      canvas.addEventListener("pointerdown", () => this.unlock(), { once: false });
+      this.preload();
+    },
+
+    ensureCtx() {
+      if (!this.ctx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return false;
+        this.ctx = new Ctx();
+        this.master = this.ctx.createGain();
+        this.musicGain = this.ctx.createGain();
+        this.sfxGain = this.ctx.createGain();
+        this.musicGain.connect(this.master);
+        this.sfxGain.connect(this.master);
+        this.master.connect(this.ctx.destination);
+        this.applyVolumes();
+      }
+      return true;
+    },
+
+    applyVolumes() {
+      if (!this.master) return;
+      this.musicGain.gain.value = this.musicOn ? 0.32 : 0;
+      this.sfxGain.gain.value = this.sfxOn ? 0.55 : 0;
+    },
+
+    unlock() {
+      if (!this.ensureCtx()) return;
+      if (this.ctx.state === "suspended") this.ctx.resume();
+      this.unlocked = true;
+      this.applyVolumes();
+      this.syncMusic();
+    },
+
+    preload() {
+      for (const [name, paths] of Object.entries(AUDIO_FILES)) {
+        if (name === "menu" || name === "battle") continue;
+        this.loadFile(name, paths).catch(() => {});
+      }
+      this.loadFile("menu", AUDIO_FILES.menu).catch(() => {});
+      this.loadFile("battle", AUDIO_FILES.battle).catch(() => {});
+    },
+
+    loadFile(name, paths) {
+      return new Promise((resolve, reject) => {
+        if (this.cache[name]) { resolve(this.cache[name]); return; }
+        const list = Array.isArray(paths) ? paths : [paths];
+        let i = 0;
+        const tryNext = () => {
+          if (i >= list.length) { reject(new Error("no file")); return; }
+          const el = new Audio();
+          el.preload = "auto";
+          el.src = list[i++];
+          el.addEventListener("canplaythrough", () => {
+            this.cache[name] = el;
+            resolve(el);
+          }, { once: true });
+          el.addEventListener("error", tryNext, { once: true });
+        };
+        tryNext();
+      });
+    },
+
+    playFile(name, vol) {
+      const el = this.cache[name];
+      if (!el || !this.sfxOn) return false;
+      try {
+        const c = el.cloneNode();
+        c.volume = clamp(vol == null ? 0.7 : vol, 0, 1);
+        c.play().catch(() => {});
+        return true;
+      } catch (e) { return false; }
+    },
+
+    tone(freq, dur, type, vol, when, useMusicBus) {
+      if (!this.ensureCtx()) return;
+      if (useMusicBus ? !this.musicOn : !this.sfxOn) return;
+      const t0 = when || this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const g = this.ctx.createGain();
+      osc.type = type || "square";
+      osc.frequency.setValueAtTime(freq, t0);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol * 0.35, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g);
+      g.connect(useMusicBus ? this.musicGain : this.sfxGain);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    },
+
+    noise(dur, vol) {
+      if (!this.ensureCtx() || !this.sfxOn) return;
+      const t0 = this.ctx.currentTime;
+      const bufferSize = Math.floor(this.ctx.sampleRate * dur);
+      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+      const src = this.ctx.createBufferSource();
+      const g = this.ctx.createGain();
+      src.buffer = buffer;
+      g.gain.value = vol * 0.25;
+      src.connect(g);
+      g.connect(this.sfxGain);
+      src.start(t0);
+    },
+
+    sfx(name) {
+      if (!this.unlocked) return;
+      this.applyVolumes();
+      if (this.playFile(name, 0.75)) return;
+      if (!this.ensureCtx()) return;
+      switch (name) {
+        case "dash":
+          this.tone(220, 0.06, "triangle", 0.5);
+          this.tone(440, 0.04, "square", 0.25, this.ctx.currentTime + 0.03);
+          break;
+        case "clash":
+          this.noise(0.08, 0.7);
+          this.tone(880, 0.05, "sawtooth", 0.4);
+          this.tone(1200, 0.04, "square", 0.2, this.ctx.currentTime + 0.02);
+          break;
+        case "hit":
+          this.tone(120, 0.15, "sine", 0.8);
+          this.tone(60, 0.2, "triangle", 0.5, this.ctx.currentTime + 0.02);
+          break;
+        case "item":
+          this.tone(523, 0.07, "sine", 0.45);
+          this.tone(784, 0.1, "sine", 0.4, this.ctx.currentTime + 0.07);
+          break;
+        case "bounce":
+          this.tone(180, 0.07, "triangle", 0.45);
+          break;
+        case "roundWin":
+          [523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.12, "square", 0.35, this.ctx.currentTime + i * 0.1));
+          break;
+        case "gameWin":
+          [392, 523, 659, 784, 1046].forEach((f, i) => this.tone(f, 0.14, "sine", 0.4, this.ctx.currentTime + i * 0.12));
+          break;
+        case "click":
+          this.tone(660, 0.04, "square", 0.3);
+          break;
+      }
+    },
+
+    stopMusic() {
+      if (this.musicEl) {
+        this.musicEl.pause();
+        this.musicEl = null;
+      }
+      if (this.bgmTimer) {
+        clearInterval(this.bgmTimer);
+        this.bgmTimer = null;
+      }
+      this.musicName = "";
+    },
+
+    playMusic(name) {
+      if (!this.musicOn) return;
+      if (this.musicName === name) return;
+      this.stopMusic();
+      this.musicName = name;
+      const paths = AUDIO_FILES[name];
+      const el = this.cache[name];
+      if (el) {
+        this.musicEl = el.cloneNode();
+        this.musicEl.loop = true;
+        this.musicEl.volume = 0.45;
+        this.musicEl.play().catch(() => this.startProceduralBgm(name));
+        return;
+      }
+      this.loadFile(name, paths).then((loaded) => {
+        if (this.musicName !== name) return;
+        this.musicEl = loaded.cloneNode();
+        this.musicEl.loop = true;
+        this.musicEl.volume = 0.45;
+        this.musicEl.play().catch(() => this.startProceduralBgm(name));
+      }).catch(() => this.startProceduralBgm(name));
+    },
+
+    startProceduralBgm(kind) {
+      if (!this.ensureCtx() || !this.musicOn) return;
+      const scale = kind === "menu"
+        ? [196, 220, 262, 294, 330]
+        : [130, 155, 196, 220, 262];
+      this.bgmStep = 0;
+      this.bgmTimer = setInterval(() => {
+        if (!this.musicOn || this.musicName === "" || !this.ctx) return;
+        const f = scale[this.bgmStep % scale.length];
+        this.tone(f, 0.2, "triangle", 0.14, this.ctx.currentTime, true);
+        this.bgmStep++;
+      }, kind === "menu" ? 420 : 320);
+    },
+
+    syncMusic() {
+      if (!this.musicOn) return;
+      if (state === STATE.MENU) this.playMusic("menu");
+      else if (state === STATE.PLAYING || state === STATE.ROUND_END) this.playMusic("battle");
+    },
+  };
+
+  const ITEM_TYPES = {
+    ROT_SPEED: { id: "rot_speed", name: "疾风", color: "#7bed9f", icon: "⚡" },
+    SHRINK: { id: "shrink", name: "缩骨", color: "#a29bfe", icon: "◉" },
+    LONG_SWORD: { id: "long_sword", name: "长剑", color: "#74b9ff", icon: "🗡" },
+    DUAL_SWORD: { id: "dual_sword", name: "双刃剑", color: "#fd79a8", icon: "⚔" },
+    SLOW_ENEMY: { id: "slow_enemy", name: "缚足", color: "#ffeaa7", icon: "🐌" },
+    SHORT_ENEMY: { id: "short_enemy", name: "断刃", color: "#fab1a0", icon: "✂" },
+  };
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function dist(x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function lineRectIntersect(x1, y1, x2, y2, rx, ry, rw, rh) {
+    const edges = [
+      [rx, ry, rx + rw, ry],
+      [rx + rw, ry, rx + rw, ry + rh],
+      [rx + rw, ry + rh, rx, ry + rh],
+      [rx, ry + rh, rx, ry],
+    ];
+    for (const [ax, ay, bx, by] of edges) {
+      const d = segSeg(x1, y1, x2, y2, ax, ay, bx, by);
+      if (d) return d;
+    }
+    return null;
+  }
+
+  function segSeg(x1, y1, x2, y2, x3, y3, x4, y4) {
+    const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(denom) < 1e-9) return null;
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+    const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) {
+      return { x: x1 + t * (x2 - x1), y: y1 + t * (y2 - y1), t };
+    }
+    return null;
+  }
+
+  function circleRectCollide(cx, cy, r, rx, ry, rw, rh) {
+    const nx = clamp(cx, rx, rx + rw);
+    const ny = clamp(cy, ry, ry + rh);
+    const dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  }
+
+  function circleCircleCollide(cx, cy, r, ox, oy, or) {
+    const dx = cx - ox, dy = cy - oy;
+    return dx * dx + dy * dy < (r + or) * (r + or);
+  }
+
+  function reflectVelocity(vx, vy, nx, ny) {
+    const dot = vx * nx + vy * ny;
+    return { vx: vx - 2 * dot * nx, vy: vy - 2 * dot * ny };
+  }
+
+  /** 将圆推出矩形，仅用于玩家身体 */
+  function pushCircleOutOfRect(cx, cy, r, rx, ry, rw, rh) {
+    const closestX = clamp(cx, rx, rx + rw);
+    const closestY = clamp(cy, ry, ry + rh);
+    let dx = cx - closestX, dy = cy - closestY;
+    const distSq = dx * dx + dy * dy;
+
+    if (distSq >= r * r - 1e-6) {
+      if (!(cx >= rx && cx <= rx + rw && cy >= ry && cy <= ry + rh)) return null;
+      const left = cx - rx, right = rx + rw - cx;
+      const top = cy - ry, bottom = ry + rh - cy;
+      const minPen = Math.min(left, right, top, bottom);
+      if (minPen === left) { dx = -1; dy = 0; }
+      else if (minPen === right) { dx = 1; dy = 0; }
+      else if (minPen === top) { dx = 0; dy = -1; }
+      else { dx = 0; dy = 1; }
+      const overlap = r + minPen;
+      return { x: cx + dx * overlap, y: cy + dy * overlap, nx: dx, ny: dy, overlap };
+    }
+
+    const dist = Math.sqrt(distSq) || 0.001;
+    const overlap = r - dist;
+    return {
+      x: cx + (dx / dist) * overlap,
+      y: cy + (dy / dist) * overlap,
+      nx: dx / dist,
+      ny: dy / dist,
+      overlap,
+    };
+  }
+
+  function pushCircleOutOfCircle(cx, cy, r, ox, oy, or) {
+    const dx = cx - ox, dy = cy - oy;
+    const d = Math.sqrt(dx * dx + dy * dy) || 0.001;
+    const overlap = r + or - d;
+    if (overlap <= 0) return null;
+    return {
+      x: cx + (dx / d) * overlap,
+      y: cy + (dy / d) * overlap,
+      nx: dx / d,
+      ny: dy / d,
+      overlap,
+    };
+  }
+
+  function getObstacleParts(obs) {
+    return obs.parts;
+  }
+
+  function getObstacleAABB(obs) {
+    if (obs.aabb) return obs.aabb;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of obs.parts) {
+      if (p.type === "rect") {
+        minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x + p.w); maxY = Math.max(maxY, p.y + p.h);
+      } else {
+        minX = Math.min(minX, p.cx - p.r); minY = Math.min(minY, p.cy - p.r);
+        maxX = Math.max(maxX, p.cx + p.r); maxY = Math.max(maxY, p.cy + p.r);
+      }
+    }
+    obs.aabb = { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+    return obs.aabb;
+  }
+
+  function aabbOverlap(a, b, pad) {
+    return !(a.x + a.w + pad < b.x || b.x + b.w + pad < a.x ||
+      a.y + a.h + pad < b.y || b.y + b.h + pad < a.y);
+  }
+
+  function partsOverlap(partsA, partsB, pad) {
+    for (const a of partsA) {
+      for (const b of partsB) {
+        if (a.type === "rect" && b.type === "rect") {
+          if (!(a.x + a.w + pad < b.x || b.x + b.w + pad < a.x ||
+            a.y + a.h + pad < b.y || b.y + b.h + pad < a.y)) return true;
+        } else if (a.type === "circle" && b.type === "circle") {
+          if (dist(a.cx, a.cy, b.cx, b.cy) < a.r + b.r + pad) return true;
+        } else {
+          const circ = a.type === "circle" ? a : b;
+          const rect = a.type === "rect" ? a : b;
+          const expanded = { x: rect.x - pad, y: rect.y - pad, w: rect.w + pad * 2, h: rect.h + pad * 2 };
+          if (circleRectCollide(circ.cx, circ.cy, circ.r, expanded.x, expanded.y, expanded.w, expanded.h)) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function resolveArenaBounds(x, y, radius) {
+    const left = BOUND_SIDE + radius;
+    const right = W - BOUND_SIDE - radius;
+    const top = BOUND_TOP + radius;
+    const bottom = H - FLOOR_H - radius;
+    let nx = x, ny = y, hit = false, hitNx = 0, hitNy = 0;
+    if (nx < left) { nx = left; hitNx = 1; hitNy = 0; hit = true; }
+    else if (nx > right) { nx = right; hitNx = -1; hitNy = 0; hit = true; }
+    if (ny < top) { ny = top; hitNx = 0; hitNy = 1; hit = true; }
+    else if (ny > bottom) { ny = bottom; hitNx = 0; hitNy = -1; hit = true; }
+    return { x: nx, y: ny, nx: hitNx, ny: hitNy, hit };
+  }
+
+  function resolvePlayerBodyCollision(px, py, radius) {
+    let x = px, y = py;
+    let hitNx = 0, hitNy = 0, hit = false;
+    for (let iter = 0; iter < 8; iter++) {
+      let moved = false;
+      for (const obs of obstacles) {
+        for (const p of obs.parts) {
+          let res = null;
+          if (p.type === "rect") res = pushCircleOutOfRect(x, y, radius, p.x, p.y, p.w, p.h);
+          else res = pushCircleOutOfCircle(x, y, radius, p.cx, p.cy, p.r);
+          if (res) {
+            x = res.x; y = res.y;
+            hitNx = res.nx; hitNy = res.ny;
+            hit = true;
+            moved = true;
+          }
+        }
+      }
+      const arena = resolveArenaBounds(x, y, radius);
+      x = arena.x;
+      y = arena.y;
+      if (arena.hit) {
+        if (arena.nx !== 0 || arena.ny !== 0) {
+          hitNx = arena.nx;
+          hitNy = arena.ny;
+        }
+        hit = true;
+        moved = true;
+      }
+      if (!moved) break;
+    }
+    return { x, y, nx: hitNx, ny: hitNy, hit };
+  }
+
+  function pointBlocked(x, y, margin) {
+    if (x < margin + BOUND_SIDE || x > W - margin - BOUND_SIDE) return true;
+    if (y < BOUND_TOP + margin || y > H - FLOOR_H - margin) return true;
+    for (const obs of obstacles) {
+      for (const p of obs.parts) {
+        if (p.type === "rect" && circleRectCollide(x, y, margin, p.x, p.y, p.w, p.h)) return true;
+        if (p.type === "circle" && circleCircleCollide(x, y, margin, p.cx, p.cy, p.r)) return true;
+      }
+    }
+    return false;
+  }
+
+  class Player {
+    constructor(id, color, darkColor, keys) {
+      this.id = id;
+      this.color = color;
+      this.darkColor = darkColor;
+      this.attackKey = keys.attack;
+      this.x = 0;
+      this.y = 0;
+      this.baseRadius = 18;
+      this.radius = 18;
+      this.score = 0;
+      this.swordAngle = rand(0, Math.PI * 2);
+      this.baseRotSpeed = 1.8;
+      this.rotSpeed = 1.8;
+      this.baseSwordLen = 42;
+      this.swordLen = 42;
+      this.weapon = "short";
+      this.dashing = false;
+      this.dashVx = 0;
+      this.dashVy = 0;
+      this.dashSpeed = 520;
+      this.dashDist = 0;
+      this.maxDashDist = 140;
+      this.alive = true;
+      this.deathAnim = 0;
+      this.attackCooldown = 0;
+      this.rotSpeedBuff = 0;
+      this.shrinkBuff = 0;
+      this.slowDebuff = 0;
+      this.shortDebuff = 0;
+      this.flash = 0;
+      this.trail = [];
+      this.rotDir = 1;
+      this.swordClashCd = 0;
+      this._bounceSfxCd = 0;
+    }
+
+    reset(x, y) {
+      this.x = x;
+      this.y = y;
+      this.radius = this.baseRadius;
+      this.swordAngle = rand(0, Math.PI * 2);
+      this.rotSpeed = this.baseRotSpeed;
+      this.swordLen = this.baseSwordLen;
+      this.weapon = "short";
+      this.dashing = false;
+      this.dashVx = 0;
+      this.dashVy = 0;
+      this.dashDist = 0;
+      this.alive = true;
+      this.deathAnim = 0;
+      this.attackCooldown = 0;
+      this.rotSpeedBuff = 0;
+      this.shrinkBuff = 0;
+      this.slowDebuff = 0;
+      this.shortDebuff = 0;
+      this.flash = 0;
+      this.trail = [];
+      this.rotDir = 1;
+      this.swordClashCd = 0;
+      this._bounceSfxCd = 0;
+    }
+
+    getBlades() {
+      const r = this.radius;
+      const off = r * 0.3;
+      const blades = [];
+      const add = (angle, len) => {
+        const bx = this.x + Math.cos(angle) * off;
+        const by = this.y + Math.sin(angle) * off;
+        const tx = this.x + Math.cos(angle) * len;
+        const ty = this.y + Math.sin(angle) * len;
+        blades.push({ x1: bx, y1: by, x2: tx, y2: ty, angle, len });
+      };
+      const len = this.effectiveSwordLen;
+      add(this.swordAngle, len);
+      if (this.weapon === "dual") add(this.swordAngle + Math.PI, len * 0.85);
+      return blades;
+    }
+
+    get angularSpeed() {
+      return this.effectiveRotSpeed * this.rotDir;
+    }
+
+    get effectiveRotSpeed() {
+      let s = this.rotSpeed;
+      if (this.rotSpeedBuff > 0) s *= 1.6;
+      if (this.slowDebuff > 0) s *= 0.45;
+      return s;
+    }
+
+    get effectiveSwordLen() {
+      let len = this.swordLen;
+      if (this.weapon === "long") len = this.baseSwordLen * 1.55;
+      if (this.shortDebuff > 0) len *= 0.55;
+      return len;
+    }
+
+    get effectiveRadius() {
+      return this.shrinkBuff > 0 ? this.baseRadius * 0.62 : this.baseRadius;
+    }
+
+    swordTip() {
+      const len = this.effectiveSwordLen;
+      return {
+        x: this.x + Math.cos(this.swordAngle) * len,
+        y: this.y + Math.sin(this.swordAngle) * len,
+      };
+    }
+
+    swordBase() {
+      const off = 8;
+      return {
+        x: this.x + Math.cos(this.swordAngle) * off,
+        y: this.y + Math.sin(this.swordAngle) * off,
+      };
+    }
+
+    startAttack() {
+      if (!this.alive || this.dashing || this.attackCooldown > 0) return false;
+      this.dashing = true;
+      this.dashVx = Math.cos(this.swordAngle) * this.dashSpeed;
+      this.dashVy = Math.sin(this.swordAngle) * this.dashSpeed;
+      this.dashDist = 0;
+      this.attackCooldown = 0.35;
+      this.flash = 0.15;
+      AudioSys.sfx("dash");
+      return true;
+    }
+
+    applyItem(type, opponent) {
+      switch (type.id) {
+        case "rot_speed": this.rotSpeedBuff = 8; break;
+        case "shrink": this.shrinkBuff = 8; this.radius = this.effectiveRadius; break;
+        case "long_sword": this.weapon = "long"; break;
+        case "dual_sword": this.weapon = "dual"; break;
+        case "slow_enemy": if (opponent) opponent.slowDebuff = 8; break;
+        case "short_enemy": if (opponent) opponent.shortDebuff = 8; break;
+      }
+    }
+
+    update(dt, other, keys) {
+      if (this.rotSpeedBuff > 0) this.rotSpeedBuff -= dt;
+      if (this.shrinkBuff > 0) { this.shrinkBuff -= dt; this.radius = this.effectiveRadius; }
+      else this.radius = this.baseRadius;
+      if (this.slowDebuff > 0) this.slowDebuff -= dt;
+      if (this.shortDebuff > 0) this.shortDebuff -= dt;
+      if (this.attackCooldown > 0) this.attackCooldown -= dt;
+      if (this.flash > 0) this.flash -= dt;
+
+      if (!this.alive) {
+        this.deathAnim += dt;
+        return;
+      }
+
+      if (this.swordClashCd > 0) this.swordClashCd -= dt;
+      if (this._bounceSfxCd > 0) this._bounceSfxCd -= dt;
+
+      if (!this.dashing) {
+        this.swordAngle += this.angularSpeed * dt;
+        if (keys[this.attackKey]) this.startAttack();
+      } else {
+        const prevX = this.x, prevY = this.y;
+        const step = this.dashSpeed * dt;
+        this.x += this.dashVx * dt;
+        this.y += this.dashVy * dt;
+        this.dashDist += step;
+
+        this.trail.push({ x: prevX, y: prevY, life: 0.25 });
+        if (this.trail.length > 12) this.trail.shift();
+
+        const bodyR = this.radius;
+        const resolved = resolvePlayerBodyCollision(this.x, this.y, bodyR);
+        if (resolved.hit) {
+          this.x = resolved.x;
+          this.y = resolved.y;
+          const ref = reflectVelocity(this.dashVx, this.dashVy, resolved.nx, resolved.ny);
+          this.dashVx = ref.vx * 0.82;
+          this.dashVy = ref.vy * 0.82;
+          spawnParticles(this.x, this.y, this.color, 6);
+          if (!this._bounceSfxCd || this._bounceSfxCd <= 0) {
+            AudioSys.sfx("bounce");
+            this._bounceSfxCd = 0.12;
+          }
+        } else {
+          this.x = resolved.x;
+          this.y = resolved.y;
+        }
+
+        if (this.dashDist >= this.maxDashDist) {
+          this.dashing = false;
+        }
+      }
+
+      for (let i = this.trail.length - 1; i >= 0; i--) {
+        this.trail[i].life -= dt;
+        if (this.trail[i].life <= 0) this.trail.splice(i, 1);
+      }
+    }
+
+    draw() {
+      const r = this.alive ? this.radius : this.radius * (1 - Math.min(1, this.deathAnim) * 0.8);
+      const alpha = this.alive ? 1 : Math.max(0, 1 - this.deathAnim * 1.2);
+
+      for (const t of this.trail) {
+        ctx.globalAlpha = (t.life / 0.25) * 0.35 * alpha;
+        ctx.fillStyle = this.color;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, r * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = alpha;
+
+      if (this.flash > 0) {
+        ctx.shadowColor = "#fff";
+        ctx.shadowBlur = 20;
+      }
+
+      const grad = ctx.createRadialGradient(this.x - 4, this.y - 4, 2, this.x, this.y, r);
+      grad.addColorStop(0, this.color);
+      grad.addColorStop(1, this.darkColor);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.35)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.shadowBlur = 0;
+      this.drawSwords(r);
+      ctx.globalAlpha = 1;
+
+      if (!this.alive && this.deathAnim < 1.5) {
+        ctx.strokeStyle = this.color;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = (1 - this.deathAnim / 1.5) * 0.6;
+        for (let i = 0; i < 3; i++) {
+          const a = this.deathAnim * 4 + i * 2.1;
+          ctx.beginPath();
+          ctx.arc(this.x, this.y, r + this.deathAnim * 30 + i * 8, a, a + 1.5);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    drawSwords(r) {
+      const drawBlade = (angle, len, width) => {
+        const bx = this.x + Math.cos(angle) * (r * 0.3);
+        const by = this.y + Math.sin(angle) * (r * 0.3);
+        const tx = this.x + Math.cos(angle) * len;
+        const ty = this.y + Math.sin(angle) * len;
+
+        ctx.strokeStyle = COLORS.swordGlow;
+        ctx.lineWidth = width + 6;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+
+        const blade = ctx.createLinearGradient(bx, by, tx, ty);
+        blade.addColorStop(0, "#aaa");
+        blade.addColorStop(0.5, COLORS.sword);
+        blade.addColorStop(1, "#fff8e8");
+        ctx.strokeStyle = blade;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+
+        ctx.fillStyle = "#c9a227";
+        ctx.beginPath();
+        ctx.arc(bx, by, 3, 0, Math.PI * 2);
+        ctx.fill();
+      };
+
+      const len = this.effectiveSwordLen;
+      const w = this.weapon === "long" ? 5 : 4;
+      drawBlade(this.swordAngle, len, w);
+      if (this.weapon === "dual") {
+        drawBlade(this.swordAngle + Math.PI, len * 0.85, 3);
+      }
+    }
+  }
+
+  const keys = {};
+  const aiKeys = { Enter: false };
+  const AI_SKILL = 0.92;
+
+  const player1 = new Player(1, COLORS.p1, COLORS.p1Dark, { attack: "Space" });
+  const player2 = new Player(2, COLORS.p2, COLORS.p2Dark, { attack: "Enter" });
+
+  function normalizeAngle(a) {
+    while (a > Math.PI) a -= Math.PI * 2;
+    while (a < -Math.PI) a += Math.PI * 2;
+    return a;
+  }
+
+  function angleTo(fromX, fromY, toX, toY) {
+    return Math.atan2(toY - fromY, toX - fromX);
+  }
+
+  function swordAlignedAt(player, targetAngle, threshold) {
+    const d1 = Math.abs(normalizeAngle(player.swordAngle - targetAngle));
+    const d2 = Math.abs(normalizeAngle(player.swordAngle + Math.PI - targetAngle));
+    return Math.min(d1, d2) < threshold;
+  }
+
+  function timeUntilSwordAligns(player, targetAngle) {
+    const t1 = timeUntilSwordAlignsSingle(player, targetAngle);
+    const t2 = timeUntilSwordAlignsSingle(player, targetAngle + Math.PI);
+    return Math.min(t1, t2);
+  }
+
+  function timeUntilSwordAlignsSingle(player, targetAngle) {
+    const diff = normalizeAngle(targetAngle - player.swordAngle);
+    const w = player.angularSpeed;
+    if (Math.abs(diff) < 0.08) return 0;
+    if (Math.sign(diff) !== Math.sign(w)) return Infinity;
+    return Math.abs(diff) / Math.abs(w);
+  }
+
+  function dashEndBlocked(player) {
+    const ex = player.x + Math.cos(player.swordAngle) * player.maxDashDist * 0.85;
+    const ey = player.y + Math.sin(player.swordAngle) * player.maxDashDist * 0.85;
+    return pointBlocked(ex, ey, player.radius + 4);
+  }
+
+  function dashMovesCloser(ai, tx, ty, minGain) {
+    const ex = ai.x + Math.cos(ai.swordAngle) * ai.maxDashDist * 0.88;
+    const ey = ai.y + Math.sin(ai.swordAngle) * ai.maxDashDist * 0.88;
+    const before = dist(ai.x, ai.y, tx, ty);
+    const after = dist(ex, ey, tx, ty);
+    return before - after > (minGain || 18);
+  }
+
+  function killRange(ai, target) {
+    return ai.effectiveSwordLen + target.radius + 38;
+  }
+
+  const DODGE_MAX_DIST = 200;
+  const FAR_DIST = 220;
+  const ITEM_PRIORITY_DIST = 200;
+
+  function isPlayerAttackingUs(human, ai) {
+    const d = dist(human.x, human.y, ai.x, ai.y);
+    if (!human.dashing || d > DODGE_MAX_DIST) return false;
+    const toAi = angleTo(human.x, human.y, ai.x, ai.y);
+    const aimed = swordAlignedAt(human, toAi, 0.56);
+    const tAim = timeUntilSwordAligns(human, toAi);
+    return aimed || tAim < 0.22;
+  }
+
+  function canKillSoon(ai, human) {
+    const d = dist(ai.x, ai.y, human.x, human.y);
+    const toHuman = angleTo(ai.x, ai.y, human.x, human.y);
+    if (canStrikeNow(ai, human)) return true;
+    return d < killRange(ai, human) + 15 && timeUntilSwordAligns(ai, toHuman) < 0.14;
+  }
+
+  function dashMovesAwayFromHuman(ai, human) {
+    const ex = ai.x + Math.cos(ai.swordAngle) * ai.maxDashDist * 0.88;
+    const ey = ai.y + Math.sin(ai.swordAngle) * ai.maxDashDist * 0.88;
+    return dist(ex, ey, human.x, human.y) > dist(ai.x, ai.y, human.x, human.y) + 22;
+  }
+
+  function awayGainIfDashAt(ai, human, angle) {
+    const ex = ai.x + Math.cos(angle) * ai.maxDashDist * 0.88;
+    const ey = ai.y + Math.sin(angle) * ai.maxDashDist * 0.88;
+    return dist(ex, ey, human.x, human.y) - dist(ai.x, ai.y, human.x, human.y);
+  }
+
+  function bestEscapeAngle(ai, human) {
+    const toHuman = angleTo(ai.x, ai.y, human.x, human.y);
+    const candidates = [
+      toHuman + Math.PI,
+      toHuman + Math.PI * 0.62,
+      toHuman - Math.PI * 0.62,
+      toHuman + Math.PI * 0.4,
+      toHuman - Math.PI * 0.4,
+    ];
+    let best = candidates[0];
+    let bestScore = Infinity;
+    for (const a of candidates) {
+      const away = awayGainIfDashAt(ai, human, a);
+      if (away < 18) continue;
+      const t = timeUntilSwordAligns(ai, a);
+      const diff = Math.min(
+        Math.abs(normalizeAngle(ai.swordAngle - a)),
+        Math.abs(normalizeAngle(ai.swordAngle + Math.PI - a))
+      );
+      const score = t * 1.3 + diff * 2 - away * 0.04;
+      if (score < bestScore) { bestScore = score; best = a; }
+    }
+    return best;
+  }
+
+  function pickBestItem(ai, human) {
+    let best = null, bestScore = -1;
+    for (const it of items) {
+      const di = dist(ai.x, ai.y, it.x, it.y);
+      const dh = dist(human.x, human.y, it.x, it.y);
+      const nearer = di < dh ? 1.35 : 1;
+      const score = nearer * (420 / (di + 35));
+      if (score > bestScore) { bestScore = score; best = it; }
+    }
+    return best;
+  }
+
+  function canStrikeNow(ai, human) {
+    const d = dist(ai.x, ai.y, human.x, human.y);
+    const toHuman = angleTo(ai.x, ai.y, human.x, human.y);
+    return d < killRange(ai, human) && swordAlignedAt(ai, toHuman, 0.48);
+  }
+
+  function shouldPrioritizeItem(ai, human, item) {
+    const di = dist(ai.x, ai.y, item.x, item.y);
+    const d = dist(ai.x, ai.y, human.x, human.y);
+    if (di < ITEM_PRIORITY_DIST) return true;
+    if (d > FAR_DIST && di < 320) return true;
+    if (di < d * 0.75) return true;
+    return false;
+  }
+
+  function tryItemIntent(ai, item) {
+    const di = dist(ai.x, ai.y, item.x, item.y);
+    const toItem = angleTo(ai.x, ai.y, item.x, item.y);
+    if (di < 24) return null;
+    if (!(swordAlignedAt(ai, toItem, 0.55) || timeUntilSwordAligns(ai, toItem) < 0.17)) return null;
+    if (!dashMovesCloser(ai, item.x, item.y, 6)) return null;
+    return { intent: "item", urgency: di < 120 ? 0.95 : 0.88 };
+  }
+
+  function tryChaseIntent(ai, human, d, toHuman, kRange) {
+    const farFromHuman = d > kRange + 20;
+    const tAlignHuman = timeUntilSwordAligns(ai, toHuman);
+    const aligned = swordAlignedAt(ai, toHuman, 0.52);
+    if (!farFromHuman && d < kRange + 50) {
+      if (tAlignHuman < 0.12 && d < killRange(ai, human) + 20) {
+        return { intent: "kill", urgency: 0.92 };
+      }
+    }
+    if ((aligned || tAlignHuman < 0.2) && dashMovesCloser(ai, human.x, human.y, 8)) {
+      return { intent: "chase", urgency: 0.9 };
+    }
+    return null;
+  }
+
+  function updateAI(ai, human) {
+    aiKeys.Enter = false;
+    if (!ai.alive || !human.alive) return;
+    if (ai.dashing || ai.attackCooldown > 0) return;
+
+    const d = dist(ai.x, ai.y, human.x, human.y);
+    const toHuman = angleTo(ai.x, ai.y, human.x, human.y);
+    const kRange = killRange(ai, human);
+    const inKillRange = d < kRange;
+    const tAlignHuman = timeUntilSwordAligns(ai, toHuman);
+    const strikeNow = canStrikeNow(ai, human);
+    const killSoon = canKillSoon(ai, human);
+    const playerRushing = isPlayerAttackingUs(human, ai);
+
+    const escapeAngle = bestEscapeAngle(ai, human);
+    const escapeAligned = swordAlignedAt(ai, escapeAngle, 0.5);
+    const tEscape = timeUntilSwordAligns(ai, escapeAngle);
+
+    let intent = null;
+    let urgency = 0;
+
+    const bestItem = pickBestItem(ai, human);
+
+    // 1) 能击杀：优先进攻（玩家冲过来且已对准我们时，仅让位给闪避）
+    if (strikeNow) {
+      intent = "kill";
+      urgency = 1;
+    } else if (killSoon && !playerRushing) {
+      intent = "kill";
+      urgency = 0.94;
+    } else if (killSoon && playerRushing && tAlignHuman < 0.08) {
+      intent = "kill";
+      urgency = 0.9;
+    }
+
+    // 2) 玩家出击：立即闪避（距离内且剑朝我们）
+    if (!intent && playerRushing) {
+      if (escapeAligned && dashMovesAwayFromHuman(ai, human)) {
+        intent = "dodge";
+        urgency = 0.99;
+      } else if (tEscape < 0.14 && awayGainIfDashAt(ai, human, escapeAngle) > 15) {
+        intent = "dodge";
+        urgency = 0.96;
+      } else if (escapeAligned) {
+        intent = "dodge";
+        urgency = 0.92;
+      }
+    }
+
+    // 3) 道具：靠近道具时优先于追击远处玩家
+    if (bestItem && intent !== "kill") {
+      const prioritizeItem = shouldPrioritizeItem(ai, human, bestItem);
+      const playerFar = d > FAR_DIST;
+      if (prioritizeItem && (intent !== "dodge" || playerFar)) {
+        const itemPlan = tryItemIntent(ai, bestItem);
+        if (itemPlan) {
+          intent = itemPlan.intent;
+          urgency = itemPlan.urgency;
+        }
+      } else if (!intent && playerFar && prioritizeItem) {
+        const itemPlan = tryItemIntent(ai, bestItem);
+        if (itemPlan) { intent = itemPlan.intent; urgency = itemPlan.urgency; }
+      }
+    }
+
+    // 4) 追击 / 补刀（不在闪避状态，或距离远不会误躲）
+    if (!intent || (intent === "dodge" && d > DODGE_MAX_DIST)) {
+      if (intent === "dodge" && d > DODGE_MAX_DIST) intent = null;
+      const chasePlan = tryChaseIntent(ai, human, d, toHuman, kRange);
+      if (chasePlan) {
+        if (!intent || chasePlan.intent === "kill") {
+          intent = chasePlan.intent;
+          urgency = chasePlan.urgency;
+        }
+      }
+    }
+
+    // 5) 中距离压迫：剑快对准且玩家没在冲我们
+    if (!intent && !playerRushing && tAlignHuman < 0.16 && inKillRange) {
+      intent = "kill";
+      urgency = 0.88;
+    }
+    if (!intent && !playerRushing && tAlignHuman < 0.22 && d < 280) {
+      intent = "pressure";
+      urgency = 0.7;
+    }
+
+    // 闪避误触修正：能杀就不躲；太远不躲
+    if (intent === "dodge") {
+      if (d > DODGE_MAX_DIST || !human.dashing) intent = null;
+      else if (strikeNow || (killSoon && tAlignHuman < 0.1)) intent = "kill";
+    }
+    if (!intent && bestItem && d > FAR_DIST) {
+      const itemPlan = tryItemIntent(ai, bestItem);
+      if (itemPlan) { intent = itemPlan.intent; urgency = itemPlan.urgency; }
+    }
+    if (!intent) {
+      const chasePlan = tryChaseIntent(ai, human, d, toHuman, kRange);
+      if (chasePlan) { intent = chasePlan.intent; urgency = chasePlan.urgency; }
+    }
+
+    let shouldDash = false;
+    if (intent === "kill") shouldDash = true;
+    else if (intent === "dodge") shouldDash = true;
+    else if (intent === "chase") shouldDash = Math.random() < 0.95;
+    else if (intent === "item") shouldDash = Math.random() < 0.94;
+    else if (intent === "pressure") shouldDash = Math.random() < 0.78;
+
+    if (shouldDash && dashEndBlocked(ai)) {
+      shouldDash = intent === "dodge" ? Math.random() < 0.55 : Math.random() < 0.4;
+    }
+
+    if (shouldDash) ai.startAttack();
+  }
+
+  function getP2Keys() {
+    return gameMode === MODE.SOLO ? aiKeys : keys;
+  }
+
+  function player2Label() {
+    return gameMode === MODE.SOLO ? "AI" : "玩家2";
+  }
+
+  window.addEventListener("keydown", (e) => {
+    keys[e.code] = true;
+    if (e.code === "Escape") {
+      if (state !== STATE.MENU) initMenu();
+      e.preventDefault();
+    }
+    if (["Space", "Enter"].includes(e.code)) e.preventDefault();
+  });
+  window.addEventListener("keyup", (e) => { keys[e.code] = false; });
+
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
+    menuHover = getMenuHit(mx, my);
+  });
+  canvas.addEventListener("click", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
+    if (state === STATE.GAME_END && gameEndTimer > 1.5) {
+      initMenu();
+      return;
+    }
+    if (state !== STATE.MENU) return;
+    const hit = getMenuHit(mx, my);
+    AudioSys.unlock();
+    if (hit === 0) { AudioSys.sfx("click"); startGame(MODE.PVP); }
+    if (hit === 1) { AudioSys.sfx("click"); startGame(MODE.SOLO); }
+    if (hit === 2) {
+      const rounds = [5, 10, 15];
+      const idx = rounds.indexOf(selectedRounds);
+      selectedRounds = rounds[(idx + 1) % 3];
+    }
+    if (hit === 3 && confirm("确定要退出游戏吗？")) window.close();
+  });
+
+  function spawnParticles(x, y, color, n) {
+    for (let i = 0; i < n; i++) {
+      particles.push({
+        x, y,
+        vx: rand(-120, 120),
+        vy: rand(-120, 120),
+        life: rand(0.3, 0.7),
+        color,
+        size: rand(2, 5),
+      });
+    }
+  }
+
+  function isWalkable(x, y, margin) {
+    return !pointBlocked(x, y, margin);
+  }
+
+  function checkConnectivity(a, b, margin) {
+    const cell = 24;
+    const cols = Math.ceil(W / cell);
+    const rows = Math.ceil(H / cell);
+    const visited = new Uint8Array(cols * rows);
+    const sx = Math.floor(a.x / cell), sy = Math.floor(a.y / cell);
+    const tx = Math.floor(b.x / cell), ty = Math.floor(b.y / cell);
+    const stack = [[sx, sy]];
+    const idx = (x, y) => y * cols + x;
+
+    visited[idx(sx, sy)] = 1;
+    while (stack.length) {
+      const [cx, cy] = stack.pop();
+      if (cx === tx && cy === ty) return true;
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        if (visited[idx(nx, ny)]) continue;
+        const wx = nx * cell + cell / 2, wy = ny * cell + cell / 2;
+        if (isWalkable(wx, wy, margin)) {
+          visited[idx(nx, ny)] = 1;
+          stack.push([nx, ny]);
+        }
+      }
+    }
+    return false;
+  }
+
+  function makeObstacle(type) {
+    if (type === "rect") {
+      const w = rand(70, 160), h = rand(18, 32);
+      const x = rand(BOUND_SIDE + 30, W - w - BOUND_SIDE - 30);
+      const y = rand(BOUND_TOP + 40, H - FLOOR_H - h - 36);
+      return { type: "rect", parts: [{ type: "rect", x, y, w, h }] };
+    }
+    if (type === "circle") {
+      const r = rand(28, 48);
+      const cx = rand(BOUND_SIDE + r + 30, W - BOUND_SIDE - r - 30);
+      const cy = rand(BOUND_TOP + r + 30, H - FLOOR_H - r - 36);
+      return { type: "circle", parts: [{ type: "circle", cx, cy, r }] };
+    }
+    if (type === "L") {
+      const w = rand(90, 140), h = rand(90, 140), t = rand(18, 26);
+      const x = rand(BOUND_SIDE + 30, W - w - BOUND_SIDE - 30);
+      const y = rand(BOUND_TOP + 30, H - FLOOR_H - h - 36);
+      return {
+        type: "L",
+        parts: [
+          { type: "rect", x, y, w, t },
+          { type: "rect", x, y, t, h },
+        ],
+      };
+    }
+    if (type === "cross") {
+      const arm = rand(50, 75), t = rand(18, 26);
+      const cx = rand(100, W - 100);
+      const cy = rand(BOUND_TOP + arm + 30, H - FLOOR_H - arm - 40);
+      return {
+        type: "cross",
+        parts: [
+          { type: "rect", x: cx - arm, y: cy - t / 2, w: arm * 2, h: t },
+          { type: "rect", x: cx - t / 2, y: cy - arm, w: t, h: arm * 2 },
+        ],
+      };
+    }
+    return null;
+  }
+
+  function canPlaceObstacle(obs, existing, minGap) {
+    const aabb = getObstacleAABB(obs);
+    const box = { x: aabb.x - minGap, y: aabb.y - minGap, w: aabb.w + minGap * 2, h: aabb.h + minGap * 2 };
+    const playTop = BOUND_TOP + minGap;
+    const playBottom = H - FLOOR_H - minGap;
+    if (box.y < playTop || box.y + box.h > playBottom) return false;
+    if (box.x < BOUND_SIDE + minGap || box.x + box.w > W - BOUND_SIDE - minGap) return false;
+
+    for (const o of existing) {
+      if (aabbOverlap(box, getObstacleAABB(o), 0)) return false;
+      if (partsOverlap(obs.parts, o.parts, minGap)) return false;
+    }
+    return true;
+  }
+
+  function generateMap() {
+    obstacles = [];
+    obstacles.push({
+      type: "floor",
+      parts: [{ type: "rect", x: 0, y: H - FLOOR_H, w: W, h: FLOOR_H }],
+    });
+
+    const types = ["rect", "circle", "L", "cross"];
+    const target = 5 + Math.floor(Math.random() * 4);
+    let attempts = 0;
+    while (obstacles.length - 1 < target && attempts < 200) {
+      attempts++;
+      const t = types[Math.floor(Math.random() * types.length)];
+      const obs = makeObstacle(t);
+      delete obs.aabb;
+      if (obs && canPlaceObstacle(obs, obstacles, 16)) obstacles.push(obs);
+    }
+
+    if (obstacles.length < 4) {
+      const fallbacks = [
+        { type: "rect", parts: [{ type: "rect", x: 180, y: 220, w: 130, h: 22 }] },
+        { type: "rect", parts: [{ type: "rect", x: 620, y: 280, w: 110, h: 22 }] },
+        { type: "rect", parts: [{ type: "rect", x: 400, y: 360, w: 100, h: 22 }] },
+      ];
+      for (const obs of fallbacks) {
+        delete obs.aabb;
+        if (canPlaceObstacle(obs, obstacles, 12)) obstacles.push(obs);
+      }
+    }
+  }
+
+  function findSpawnPositions() {
+    const margin = 22;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      generateMap();
+      let p1pos = null, p2pos = null;
+      for (let i = 0; i < 60; i++) {
+        const x = rand(margin + 30, W - margin - 30);
+        const y = rand(BOUND_TOP + margin + 10, H - FLOOR_H - margin - 10);
+        if (isWalkable(x, y, margin)) {
+          if (!p1pos) p1pos = { x, y };
+          else if (dist(x, y, p1pos.x, p1pos.y) > 180) { p2pos = { x, y }; break; }
+        }
+      }
+      if (p1pos && p2pos && checkConnectivity(p1pos, p2pos, margin)) {
+        return { p1: p1pos, p2: p2pos };
+      }
+    }
+    return { p1: { x: 200, y: H - 80 }, p2: { x: W - 200, y: H - 80 } };
+  }
+
+  function spawnItem() {
+    const types = Object.values(ITEM_TYPES);
+    const type = types[Math.floor(Math.random() * types.length)];
+    for (let i = 0; i < 30; i++) {
+      const x = rand(50, W - 50);
+      const y = rand(100, H - 60);
+      if (isWalkable(x, y, 16)) {
+        items.push({ x, y, type, bob: rand(0, Math.PI * 2), life: 12 });
+        return;
+      }
+    }
+  }
+
+  function checkSwordHit(attacker, defender) {
+    if (!defender.alive || !attacker.alive) return false;
+    for (const b of attacker.getBlades()) {
+      const d = pointSegDist(defender.x, defender.y, b.x1, b.y1, b.x2, b.y2);
+      if (d < defender.radius + 8) return true;
+    }
+    return false;
+  }
+
+  function bladeSegIntersect(b1, b2) {
+    return segSeg(b1.x1, b1.y1, b1.x2, b1.y2, b2.x1, b2.y1, b2.x2, b2.y2);
+  }
+
+  function resolveSwordClash(p1, p2) {
+    if (p1.swordClashCd > 0 || p2.swordClashCd > 0) return false;
+    if (!p1.alive || !p2.alive) return false;
+
+    const blades1 = p1.getBlades();
+    const blades2 = p2.getBlades();
+    let contact = null;
+
+    for (const b1 of blades1) {
+      for (const b2 of blades2) {
+        const hit = bladeSegIntersect(b1, b2);
+        if (hit) { contact = { hit, b1, b2 }; break; }
+      }
+      if (contact) break;
+    }
+    if (!contact) return false;
+
+    const { hit, b1, b2 } = contact;
+    const r1 = b1.len * 0.75;
+    const r2 = b2.len * 0.75;
+    const w1 = p1.angularSpeed;
+    const w2 = p2.angularSpeed;
+    const v1 = w1 * r1;
+    const v2 = w2 * r2;
+    const m1 = r1, m2 = r2;
+    const sumM = m1 + m2;
+    const v1n = ((m1 - m2) * v1 + 2 * m2 * v2) / sumM;
+    const v2n = ((m2 - m1) * v2 + 2 * m1 * v1) / sumM;
+
+    p1.rotSpeed = clamp(Math.abs(v1n) / r1, 0.9, 3.8);
+    p2.rotSpeed = clamp(Math.abs(v2n) / r2, 0.9, 3.8);
+
+    if (Math.sign(v1n) !== Math.sign(w1) && Math.abs(v1n) > 0.4) p1.rotDir *= -1;
+    if (Math.sign(v2n) !== Math.sign(w2) && Math.abs(v2n) > 0.4) p2.rotDir *= -1;
+
+    if (Math.abs(v1 - v2) < 0.3 && Math.random() < 0.35) {
+      if (Math.abs(w1) >= Math.abs(w2)) p1.rotDir *= -1;
+      else p2.rotDir *= -1;
+    }
+
+    if (p1.dashing) { p1.dashVx *= 0.45; p1.dashVy *= 0.45; }
+    if (p2.dashing) { p2.dashVx *= 0.45; p2.dashVy *= 0.45; }
+
+    p1.swordClashCd = 0.12;
+    p2.swordClashCd = 0.12;
+    swordClashCd = 0.05;
+
+    const sparkColor = "#ffeaa7";
+    AudioSys.sfx("clash");
+    spawnParticles(hit.x, hit.y, sparkColor, 12);
+    for (let i = 0; i < 4; i++) {
+      particles.push({
+        x: hit.x, y: hit.y,
+        vx: rand(-180, 180), vy: rand(-180, 180),
+        life: 0.2,
+        color: "#fff",
+        size: rand(2, 4),
+      });
+    }
+    return true;
+  }
+
+  function pointSegDist(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-6) return dist(px, py, x1, y1);
+    let t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    t = clamp(t, 0, 1);
+    return dist(px, py, x1 + t * dx, y1 + t * dy);
+  }
+
+  function checkItemPickup(p) {
+    for (let i = items.length - 1; i >= 0; i--) {
+      const it = items[i];
+      if (dist(p.x, p.y, it.x, it.y) < p.radius + 14) {
+        const opp = p.id === 1 ? player2 : player1;
+        p.applyItem(it.type, opp);
+        AudioSys.sfx("item");
+        spawnParticles(it.x, it.y, it.type.color, 10);
+        items.splice(i, 1);
+      }
+    }
+  }
+
+  function startRound() {
+    currentRound++;
+    items = [];
+    itemSpawnTimer = 3;
+    const spawns = findSpawnPositions();
+    player1.reset(spawns.p1.x, spawns.p1.y);
+    player2.reset(spawns.p2.x, spawns.p2.y);
+    state = STATE.PLAYING;
+  }
+
+  function startGame(mode) {
+    gameMode = mode || MODE.PVP;
+    totalRounds = selectedRounds;
+    currentRound = 0;
+    player1.score = 0;
+    player2.score = 0;
+    particles = [];
+    aiKeys.Enter = false;
+    AudioSys.syncMusic();
+    startRound();
+  }
+
+  function initMenu() {
+    state = STATE.MENU;
+    gameMode = MODE.PVP;
+    particles = [];
+    items = [];
+    obstacles = [];
+    aiKeys.Enter = false;
+    AudioSys.syncMusic();
+  }
+
+  function endRound(winner) {
+    winner.score++;
+    state = STATE.ROUND_END;
+    roundEndTimer = 2;
+    AudioSys.sfx("hit");
+    AudioSys.sfx("roundWin");
+    spawnParticles(winner.x, winner.y, COLORS.gold, 20);
+    for (let i = 0; i < 30; i++) {
+      particles.push({
+        x: W / 2, y: H / 2,
+        vx: rand(-200, 200), vy: rand(-200, 200),
+        life: rand(0.5, 1.2),
+        color: winner.color,
+        size: rand(3, 7),
+      });
+    }
+  }
+
+  function getMenuHit(mx, my) {
+    if (state !== STATE.MENU) return -1;
+    const cx = W / 2;
+    const buttons = [
+      { y: 248, h: 44, id: 0 },
+      { y: 300, h: 44, id: 1 },
+      { y: 352, h: 44, id: 2 },
+      { y: 404, h: 44, id: 3 },
+    ];
+    for (const b of buttons) {
+      if (mx > cx - 140 && mx < cx + 140 && my > b.y && my < b.y + b.h) return b.id;
+    }
+  }
+
+  function update(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 300 * dt;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    if (state === STATE.PLAYING) {
+      if (gameMode === MODE.SOLO) updateAI(player2, player1);
+      player1.update(dt, player2, keys);
+      player2.update(dt, player1, getP2Keys());
+      if (swordClashCd > 0) swordClashCd -= dt;
+      else resolveSwordClash(player1, player2);
+      checkItemPickup(player1);
+      checkItemPickup(player2);
+
+      itemSpawnTimer -= dt;
+      if (itemSpawnTimer <= 0) {
+        spawnItem();
+        itemSpawnTimer = rand(5, 9);
+      }
+      for (let i = items.length - 1; i >= 0; i--) {
+        items[i].bob += dt * 3;
+        items[i].life -= dt;
+        if (items[i].life <= 0) items.splice(i, 1);
+      }
+
+      if (player1.alive && checkSwordHit(player2, player1)) {
+        player1.alive = false;
+        endRound(player2);
+      } else if (player2.alive && checkSwordHit(player1, player2)) {
+        player2.alive = false;
+        endRound(player1);
+      }
+    }
+
+    if (state === STATE.ROUND_END) {
+      roundEndTimer -= dt;
+      player1.deathAnim += dt;
+      player2.deathAnim += dt;
+      if (roundEndTimer <= 0) {
+        if (currentRound >= totalRounds) {
+          state = STATE.GAME_END;
+          gameEndTimer = 0;
+          AudioSys.sfx("gameWin");
+          AudioSys.stopMusic();
+        } else {
+          startRound();
+        }
+      }
+    }
+
+    if (state === STATE.GAME_END) {
+      gameEndTimer += dt;
+    }
+  }
+
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, COLORS.bg1);
+    g.addColorStop(1, COLORS.bg2);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = "rgba(80,100,140,0.08)";
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 40) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 40) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+  }
+
+  function drawArenaBounds() {
+    const wallGrad = ctx.createLinearGradient(0, BOUND_TOP, 0, BOUND_TOP + 12);
+    wallGrad.addColorStop(0, COLORS.platformTop);
+    wallGrad.addColorStop(1, COLORS.platform);
+    ctx.fillStyle = wallGrad;
+    ctx.fillRect(0, BOUND_TOP - 10, W, 10);
+    ctx.fillRect(0, BOUND_TOP, BOUND_SIDE, H - BOUND_TOP);
+    ctx.fillRect(W - BOUND_SIDE, BOUND_TOP, BOUND_SIDE, H - BOUND_TOP);
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.fillRect(BOUND_SIDE, BOUND_TOP - 2, W - BOUND_SIDE * 2, 2);
+  }
+
+  function drawObstacles() {
+    drawArenaBounds();
+    for (const obs of obstacles) {
+      for (const p of obs.parts) {
+        if (p.type === "rect") {
+          const g = ctx.createLinearGradient(p.x, p.y, p.x, p.y + p.h);
+          g.addColorStop(0, COLORS.platformTop);
+          g.addColorStop(1, COLORS.platform);
+          ctx.fillStyle = g;
+          ctx.fillRect(p.x, p.y, p.w, p.h);
+          ctx.fillStyle = "rgba(255,255,255,0.07)";
+          ctx.fillRect(p.x, p.y, p.w, 3);
+        } else {
+          const g = ctx.createRadialGradient(p.cx - p.r * 0.3, p.cy - p.r * 0.3, 2, p.cx, p.cy, p.r);
+          g.addColorStop(0, COLORS.platformTop);
+          g.addColorStop(1, COLORS.platform);
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(p.cx, p.cy, p.r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = "rgba(255,255,255,0.1)";
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
+  function drawItems() {
+    for (const it of items) {
+      const bobY = Math.sin(it.bob) * 4;
+      const x = it.x, y = it.y + bobY;
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.beginPath();
+      ctx.ellipse(x, y + 12, 12, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      const glow = ctx.createRadialGradient(x, y, 2, x, y, 22);
+      glow.addColorStop(0, it.type.color + "88");
+      glow.addColorStop(1, "transparent");
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(x, y, 22, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = it.type.color;
+      ctx.beginPath();
+      ctx.arc(x, y, 14, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.font = "14px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(it.type.icon, x, y);
+      ctx.font = "11px Microsoft YaHei";
+      ctx.fillStyle = COLORS.ui;
+      ctx.fillText(it.type.name, x, y + 22);
+    }
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0, W, 44);
+
+    ctx.font = "bold 16px Microsoft YaHei";
+    ctx.textAlign = "left";
+    ctx.fillStyle = COLORS.p1;
+    ctx.fillText(`玩家1: ${player1.score}`, 16, 28);
+    ctx.textAlign = "right";
+    ctx.fillStyle = COLORS.p2;
+    ctx.fillText(`${player2Label()}: ${player2.score}`, W - 16, 28);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = COLORS.ui;
+    ctx.fillText(`第 ${Math.min(currentRound, totalRounds)} / ${totalRounds} 回合`, W / 2, 28);
+
+    if (state === STATE.PLAYING) {
+      ctx.font = "12px Microsoft YaHei";
+      ctx.fillStyle = "rgba(200,210,230,0.7)";
+      const tip = gameMode === MODE.SOLO
+        ? "单机模式 · 空格冲刺 · 剑刃碰对手得分"
+        : "空格/Enter冲刺 · 剑刃碰对手即得分";
+      ctx.fillText(tip, W / 2, 40);
+    }
+  }
+
+  function drawMenu() {
+    drawBackground();
+
+    ctx.textAlign = "center";
+    ctx.font = "bold 52px Microsoft YaHei";
+    const titleGrad = ctx.createLinearGradient(W/2 - 100, 0, W/2 + 100, 0);
+    titleGrad.addColorStop(0, COLORS.p1);
+    titleGrad.addColorStop(0.5, "#fff");
+    titleGrad.addColorStop(1, COLORS.p2);
+    ctx.fillStyle = titleGrad;
+    ctx.fillText("剑不剑啊", W / 2, 120);
+
+    ctx.font = "16px Microsoft YaHei";
+    ctx.fillStyle = "rgba(200,210,240,0.7)";
+    ctx.fillText("双人对战 · 旋转利剑 · 冲刺决胜", W / 2, 160);
+
+    const cx = W / 2;
+    const buttons = [
+      { text: "双人对战", y: 248, id: 0 },
+      { text: "单机模式 (对战 AI)", y: 300, id: 1 },
+      { text: `回合选择: ${selectedRounds} 回合 (点击切换)`, y: 352, id: 2 },
+      { text: "退出游戏", y: 404, id: 3 },
+    ];
+
+    for (const b of buttons) {
+      const hover = menuHover === b.id;
+      ctx.fillStyle = hover ? "rgba(80,120,200,0.5)" : "rgba(40,55,90,0.6)";
+      roundRect(cx - 140, b.y, 280, 48, 10);
+      ctx.fill();
+      ctx.strokeStyle = hover ? COLORS.gold : "rgba(100,130,180,0.5)";
+      ctx.lineWidth = 2;
+      roundRect(cx - 140, b.y, 280, 48, 10);
+      ctx.stroke();
+      ctx.fillStyle = COLORS.ui;
+      ctx.font = "18px Microsoft YaHei";
+      ctx.fillText(b.text, cx, b.y + 31);
+    }
+
+    const rounds = [5, 10, 15];
+    ctx.font = "13px Microsoft YaHei";
+    ctx.fillStyle = "rgba(150,165,200,0.6)";
+    ctx.fillText("回合可选: 5 · 10 · 15", W / 2, 468);
+    ctx.font = "12px Microsoft YaHei";
+    ctx.fillStyle = "rgba(150,165,200,0.55)";
+    ctx.fillText("单机模式由玩家1 (空格) 对战电脑 AI", W / 2, 490);
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
+
+  function drawRoundEnd() {
+    drawBackground();
+    drawObstacles();
+    drawItems();
+    player1.draw();
+    player2.draw();
+    drawHUD();
+    drawParticles();
+
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.fillRect(0, 0, W, H);
+
+    const lastWinner = !player1.alive ? player2 : player1;
+
+    ctx.textAlign = "center";
+    ctx.font = "bold 36px Microsoft YaHei";
+    ctx.fillStyle = lastWinner.color;
+    const wName = lastWinner.id === 1 ? "玩家1" : player2Label();
+    ctx.fillText(`${wName} 本回合获胜! +1`, W / 2, H / 2 - 20);
+    ctx.font = "18px Microsoft YaHei";
+    ctx.fillStyle = COLORS.ui;
+    const remain = Math.max(0, totalRounds - currentRound);
+    ctx.fillText(remain > 0 ? `剩余 ${remain} 回合...` : "即将揭晓最终胜负...", W / 2, H / 2 + 20);
+  }
+
+  function drawGameEnd() {
+    drawBackground();
+    drawHUD();
+
+    const winner = player1.score > player2.score ? player1 :
+      player2.score > player1.score ? player2 : null;
+
+    ctx.fillStyle = "rgba(0,0,0,0.5)";
+    ctx.fillRect(0, 0, W, H);
+
+    const pulse = 1 + Math.sin(gameEndTimer * 4) * 0.05;
+    ctx.save();
+    ctx.translate(W / 2, H / 2 - 40);
+    ctx.scale(pulse, pulse);
+
+    ctx.textAlign = "center";
+    if (winner) {
+      const winName = winner.id === 1 ? "玩家1" : player2Label();
+      ctx.font = "bold 48px Microsoft YaHei";
+      ctx.fillStyle = winner.color;
+      ctx.fillText(`${winName} 胜利!`, 0, 0);
+      ctx.font = "24px Microsoft YaHei";
+      ctx.fillStyle = COLORS.gold;
+      ctx.fillText(`最终比分 ${player1.score} : ${player2.score}`, 0, 45);
+    } else {
+      ctx.font = "bold 42px Microsoft YaHei";
+      ctx.fillStyle = COLORS.ui;
+      ctx.fillText("平局!", 0, 0);
+      ctx.font="22px Microsoft YaHei";
+      ctx.fillText(`${player1.score} : ${player2.score}`, 0, 40);
+    }
+    ctx.restore();
+
+    drawParticles();
+
+  }
+
+  function drawParticles() {
+    for (const p of particles) {
+      ctx.globalAlpha = clamp(p.life, 0, 1);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPlaying() {
+    drawBackground();
+    drawObstacles();
+    drawItems();
+    player1.draw();
+    player2.draw();
+    drawParticles();
+    drawHUD();
+  }
+
+  function render() {
+    if (state === STATE.MENU) drawMenu();
+    else if (state === STATE.PLAYING) drawPlaying();
+    else if (state === STATE.ROUND_END) drawRoundEnd();
+    else if (state === STATE.GAME_END) {
+      drawGameEnd();
+      ctx.textAlign = "center";
+      ctx.font = "16px Microsoft YaHei";
+      ctx.fillStyle = "rgba(200,210,240,0.8)";
+      if (gameEndTimer > 1.5) {
+        ctx.fillText("点击任意处返回主菜单", W / 2, H / 2 + 100);
+      }
+    }
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  try {
+    AudioSys.init();
+    initMenu();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error("游戏启动失败:", err);
+    ctx.fillStyle = "#c8d4f0";
+    ctx.font = "16px Microsoft YaHei";
+    ctx.textAlign = "center";
+    ctx.fillText("游戏加载出错，请刷新页面 (F5)", W / 2, H / 2);
+  }
+})();
+  </script>
+</body>
+</html>
